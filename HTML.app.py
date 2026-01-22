@@ -1,253 +1,249 @@
 import streamlit as st
 import requests
 from bs4 import BeautifulSoup
-from markdownify import markdownify as md
-from readability import Document
+import trafilatura
 import re
 import time
 import random
-import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import zipfile
 import io
 
-# --- 1. 页面与样式配置 ---
+# --- 1. 页面配置与审美优化 ---
 st.set_page_config(
-    page_title="Web Clipper Ultimate | 全能采集专家", 
-    page_icon="💎",
+    page_title="Magic Clipper | 智能网页剪藏",
+    page_icon="🔮",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="collapsed"
 )
 
-# --- 2. 核心工具函数 (经过严格规范检查) ---
+# 注入自定义 CSS 提升审美 (隐藏默认菜单，优化字体)
+st.markdown("""
+    <style>
+        .reportview-container {
+            margin-top: -2em;
+        }
+        .stDeployButton {display:none;}
+        header {visibility: hidden;}
+        #MainMenu {visibility: hidden;}
+        .stTextArea textarea {
+            font-family: "SF Mono", "Roboto Mono", monospace;
+            font-size: 14px;
+            color: #333;
+        }
+    </style>
+""", unsafe_allow_html=True)
 
-def sanitize_filename(name):
-    """
-    清洗文件名，去除Windows/Mac/Linux文件系统不允许的字符
-    并去除首尾空格
-    """
-    # 替换非法字符为空格
-    clean_name = re.sub(r'[\\/*?:"<>|]', "", name)
-    # 去除多余空格和换行
-    clean_name = " ".join(clean_name.split())
-    return clean_name[:50] # 限制长度防止文件名过长报错
+# --- 2. 核心工具函数 ---
 
 def get_random_ua():
+    """生成随机 User-Agent 防止被简单的反爬拦截"""
     ua_list = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     ]
     return random.choice(ua_list)
 
 def fetch_url(url, retries=3):
+    """通用的网页下载器，带重试机制"""
     attempt = 0
     while attempt < retries:
         try:
-            time.sleep(random.uniform(0.5, 1.5))
-            headers = {"User-Agent": get_random_ua(), "Referer": "https://www.google.com/"}
+            headers = {"User-Agent": get_random_ua()}
+            # 随机延时，对服务器友好一点
+            time.sleep(random.uniform(0.3, 1.0))
             response = requests.get(url, headers=headers, timeout=15)
-            
-            # 编码防御性处理
-            if response.encoding == 'ISO-8859-1':
-                response.encoding = response.apparent_encoding if response.apparent_encoding else 'utf-8'
-            
-            if response.status_code == 403: return "ERROR: 403 Forbidden (反爬拦截)"
-            if response.status_code == 404: return "ERROR: 404 Not Found"
-            
             response.raise_for_status()
+            
+            # 处理编码问题
+            if response.encoding == 'ISO-8859-1':
+                response.encoding = response.apparent_encoding
+            
             return response.text
         except Exception as e:
             attempt += 1
-            if attempt == retries: return f"ERROR: {str(e)}"
-            time.sleep(1)
+            if attempt == retries:
+                return None
+    return None
 
-def parse_sitemap(sitemap_url):
+def clean_filename(title):
+    """文件名清洗，防止保存文件时出错"""
+    if not title:
+        return "Untitled_Document"
+    # 去除非法字符
+    clean = re.sub(r'[\\/*?:"<>|]', "", title)
+    # 压缩多余空格
+    clean = " ".join(clean.split())
+    return clean[:60]  # 限制长度
+
+# --- 3. 智能解析引擎 (核心逻辑) ---
+
+def parse_wechat(html, url):
+    """【专用通道】微信公众号解析逻辑"""
+    soup = BeautifulSoup(html, 'html.parser')
+    
+    # 1. 提取标题
+    title = soup.find('meta', property='og:title')
+    title = title['content'] if title else soup.title.string.strip()
+    
+    # 2. 提取正文容器
+    content_div = soup.find('div', id='js_content')
+    if not content_div:
+        return title, "Error: 无法找到公众号正文内容，可能是文章已删除或需要登录。"
+    
+    # 3. 修复图片懒加载 (关键步骤: data-src -> src)
+    for img in content_div.find_all('img'):
+        if 'data-src' in img.attrs:
+            img['src'] = img['data-src']
+            # 清理干扰属性
+            del img['data-src']
+    
+    # 4. 转 Markdown (使用 trafilatura 的转换引擎，保持统一)
+    # 先转回 string 喂给 trafilatura
+    html_str = str(content_div)
+    markdown = trafilatura.extract(html_str, include_images=True, include_formatting=True, output_format='markdown')
+    
+    return title, markdown
+
+def parse_general(html, url):
+    """【通用通道】GitBook / Substack / Medium / 博客"""
+    # 使用 trafilatura 智能提取，它会自动识别网页的主体内容
+    # include_links=False 保持纯净，include_images=True 保留图片链接
+    markdown = trafilatura.extract(html, include_images=True, include_formatting=True, output_format='markdown')
+    
+    # 尝试提取标题
+    soup = BeautifulSoup(html, 'html.parser')
+    title = soup.title.string.strip() if soup.title else "Unknown_Title"
+    
+    if not markdown:
+        return title, None # 提取失败
+        
+    return title, markdown
+
+def process_single_url(url):
+    """调度器：根据 URL 决定走哪条通道"""
+    url = url.strip()
+    if not url.startswith('http'):
+        return None, url, "Invalid URL"
+        
+    html = fetch_url(url)
+    if not html:
+        return None, url, "Network Error: 无法访问链接 (404/403/Timeout)"
+
     try:
-        xml_content = fetch_url(sitemap_url)
-        if xml_content.startswith("ERROR"): return None, xml_content
-        root = ET.fromstring(xml_content)
-        namespace = {'ns': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
-        urls = []
-        for url_tag in root.findall('.//ns:loc', namespace): urls.append(url_tag.text)
-        if not urls:
-            for url_tag in root.findall('.//loc'): urls.append(url_tag.text)
-        return urls, None
-    except Exception as e:
-        return None, f"Sitemap 解析异常: {str(e)}"
-
-def clean_html_content(soup, base_url):
-    for tag in soup(['script', 'style', 'iframe', 'noscript', 'header', 'footer', 'nav']): tag.decompose()
-    for img in soup.find_all('img'):
-        if img.get('src') and not img['src'].startswith('http'):
-            if img['src'].startswith('//'): img['src'] = 'https:' + img['src']
-            elif img['src'].startswith('/'): 
-                domain = '/'.join(base_url.split('/')[:3])
-                img['src'] = domain + img['src']
-    return soup
-
-def process_single_article(url):
-    """核心处理逻辑"""
-    try:
-        html_content = fetch_url(url)
-        if not html_content or html_content.startswith("ERROR:"): return None, url, html_content
-
+        # === 智能路由 ===
         if "mp.weixin.qq.com" in url:
-            soup = BeautifulSoup(html_content, 'html.parser')
-            meta_title = soup.find('meta', property='og:title')
-            title = meta_title['content'] if meta_title else soup.title.string.strip()
-            content_div = soup.find('div', id='js_content')
-            if content_div:
-                for img in content_div.find_all('img'):
-                    if 'data-src' in img.attrs: img['src'] = img['data-src']
-                final_html = str(content_div)
-            else: return None, url, "公众号内容解析失败"
+            title, content = parse_wechat(html, url)
         else:
-            doc = Document(html_content)
-            title = doc.title()
-            soup = BeautifulSoup(doc.summary(), 'html.parser')
-            soup = clean_html_content(soup, url)
-            for sidebar in soup.find_all(class_=re.compile("sidebar|toc|nav")): sidebar.decompose()
-            final_html = str(soup)
-
-        markdown_text = md(final_html, heading_style="ATX")
-        title = sanitize_filename(title)
+            title, content = parse_general(html, url)
+            
+        if not content:
+            return title, url, "Content Empty: 解析后内容为空 (可能是反爬或动态渲染)"
+            
+        # 组装最终结果
+        full_doc = f"# {title}\n\n> 来源: {url}\n> 采集时间: {time.strftime('%Y-%m-%d %H:%M')}\n\n---\n\n{content}\n\n"
+        return clean_filename(title), url, full_doc
         
-        # 返回: (清洗后的标题, 原链接, Markdown内容)
-        full_content = f"# {title}\n\n> Source: {url}\n\n{markdown_text}\n\n---\n\n"
-        return title, url, full_content
-
     except Exception as e:
-        return None, url, f"Processing Error: {str(e)}"
+        return None, url, f"System Error: {str(e)}"
 
-# --- 3. 侧边栏与配置 ---
-with st.sidebar:
-    st.image("https://cdn-icons-png.flaticon.com/512/2083/2083236.png", width=50)
-    st.header("⚙️ 控制台")
-    
-    input_mode = st.radio(
-        "1. 采集来源:", 
-        ("📝 批量链接列表", "🗺️ 站点地图 (Sitemap)"),
-        help="Sitemap 适合一次性抓取整个文档库"
-    )
-    
-    st.divider()
-    
-    # --- 新增功能：下载格式选择 ---
-    output_format = st.radio(
-        "2. 下载格式:",
-        ("📑 合并为一个 Markdown", "📦 分文件打包 (ZIP)"),
-        captions=["所有文章在一个长文档里", "每篇文章一个单独的 .md 文件"],
-        index=0
-    )
-    
-    st.divider()
-    st.caption("Web Clipper Ultimate v3.0")
+# --- 4. UI 界面逻辑 ---
 
-# --- 4. 主界面逻辑 ---
-st.title("💎 Web Clipper Ultimate")
+st.title("🔮 Magic Clipper")
+st.caption("支持：微信公众号 / GitBook / Substack / Medium / 知乎专栏 等")
 
-input_placeholder = "https://mp.weixin.qq.com/s/...\nhttps://example.com/article..." if "列表" in input_mode else "https://example.com/sitemap.xml"
-input_label = "🔗 在此粘贴链接 (每行一个)" if "列表" in input_mode else "🗺️ 在此粘贴 Sitemap.xml 链接"
+with st.expander("⚙️ 使用说明 & 设置", expanded=False):
+    st.info("💡 **Tips:** \n1. 直接粘贴链接，系统会自动识别来源。\n2. GitBook 如果抓取失败，通常是因为它是纯动态页面，您可以尝试粘贴它的 Sitemap。")
+    output_mode = st.radio("下载格式:", ["📦 分文件打包 (ZIP)", "📑 合并为一个 Markdown"], horizontal=True)
 
-with st.form("main_form"):
-    urls_input = st.text_area(input_label, height=200, placeholder=input_placeholder)
-    submitted = st.form_submit_button("⚡ 开始采集", type="primary")
+# 输入区域
+urls_input = st.text_area("🔗在此粘贴链接 (一行一个)", height=150, placeholder="https://mp.weixin.qq.com/s/...\nhttps://docs.gitbook.com/...")
 
-if submitted and urls_input:
-    target_urls = []
-    
-    # 1. 解析 URL
-    if "Sitemap" in input_mode:
-        with st.spinner("🔍 正在扫描站点地图..."):
-            parsed_urls, error = parse_sitemap(urls_input.strip())
-            if error: st.error(error)
-            else: target_urls = parsed_urls
+# 执行按钮
+if st.button("🚀 开始采集", type="primary"):
+    if not urls_input.strip():
+        st.warning("⚠️ 请先输入链接")
     else:
+        # 清洗输入
         target_urls = [line.strip() for line in urls_input.split('\n') if line.strip().startswith('http')]
-
-    # 2. 执行采集
-    if target_urls:
-        success_results = [] # 存储 (title, url, content)
-        fail_logs = []       # 存储 (url, reason)
         
-        st.info(f"🚀 任务已启动，共 {len(target_urls)} 个目标。格式: {output_format}")
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        # 动态调整线程数
-        workers = 4 if len(target_urls) < 50 else 3
-        
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            future_to_url = {executor.submit(process_single_article, url): url for url in target_urls}
-            completed = 0
-            
-            for future in as_completed(future_to_url):
-                title, url, content = future.result()
-                completed += 1
-                progress_bar.progress(completed / len(target_urls))
-                status_text.text(f"Processing ({completed}/{len(target_urls)}): {title if title else '解析中...'}")
-                
-                if title:
-                    success_results.append((title, url, content))
-                else:
-                    fail_logs.append(f"{url} | 原因: {content}")
-
-        progress_bar.empty()
-        status_text.empty()
-        
-        # 3. 结果统计
-        col1, col2 = st.columns(2)
-        col1.metric("✅ 成功", len(success_results))
-        col2.metric("⚠️ 失败", len(fail_logs), delta_color="inverse")
-        
-        if fail_logs:
-            with st.expander("查看失败日志"):
-                st.text("\n".join(fail_logs))
-
-        # 4. 生成下载文件 (关键分支逻辑)
-        timestamp = int(time.time())
-        
-        # === 模式 A: 合并下载 ===
-        if "合并" in output_format:
-            full_doc = f"# Export Collection\nDate: {time.strftime('%Y-%m-%d')}\n\n---\n\n"
-            if fail_logs:
-                full_doc += "## ⚠️ Failed URLs\n" + "\n".join(fail_logs) + "\n\n---\n\n"
-            
-            for _, _, content in success_results:
-                full_doc += content
-                
-            st.download_button(
-                label="📥 下载合并文档 (.md)",
-                data=full_doc.encode('utf-8-sig'), # 强制 BOM 修复乱码
-                file_name=f"merged_export_{timestamp}.md",
-                mime="text/markdown",
-                type="primary"
-            )
-
-        # === 模式 B: ZIP 打包下载 ===
+        if not target_urls:
+            st.error("❌ 没有检测到有效的 http/https 链接")
         else:
-            # 在内存中创建 ZIP
-            zip_buffer = io.BytesIO()
-            with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
-                # 写入成功的文件
-                for idx, (title, _, content) in enumerate(success_results):
-                    # 文件名格式: 01_标题.md (防止重名覆盖)
-                    file_name = f"{str(idx+1).zfill(3)}_{title}.md"
-                    # 写入 ZIP 时强制 utf-8-sig 编码内容
-                    zip_file.writestr(file_name, content.encode('utf-8-sig'))
+            success_data = [] # 存 tuple (filename, content)
+            fail_log = []     # 存 string
+            
+            # 进度容器
+            progress_bar = st.progress(0)
+            status_container = st.status("正在处理任务队列...", expanded=True)
+            
+            # 线程池执行
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                future_to_url = {executor.submit(process_single_url, url): url for url in target_urls}
                 
-                # 写入失败日志 (如果有)
-                if fail_logs:
-                    error_log = "Failed URLs:\n" + "\n".join(fail_logs)
-                    zip_file.writestr("_失败日志_errors.txt", error_log.encode('utf-8-sig'))
+                completed_count = 0
+                for future in as_completed(future_to_url):
+                    title, url, content = future.result()
+                    completed_count += 1
+                    progress_bar.progress(completed_count / len(target_urls))
+                    
+                    if content and not content.startswith(("Network Error", "Content Empty", "System Error", "Error:")):
+                        success_data.append((title, content))
+                        status_container.write(f"✅ [成功] {title}")
+                    else:
+                        error_msg = content if content else "Unknown Error"
+                        fail_log.append(f"{url} -> {error_msg}")
+                        status_container.write(f"❌ [失败] {url} ({error_msg})")
             
-            st.download_button(
-                label="📦 下载压缩包 (.zip)",
-                data=zip_buffer.getvalue(),
-                file_name=f"batch_export_{timestamp}.zip",
-                mime="application/zip",
-                type="primary"
-            )
+            status_container.update(label="✅ 任务完成!", state="complete", expanded=False)
             
-    else:
-        st.warning("⚠️ 未检测到有效链接，请检查输入。")
+            # --- 结果交付区域 ---
+            st.divider()
+            col1, col2 = st.columns(2)
+            col1.metric("成功抓取", len(success_data))
+            col2.metric("失败链接", len(fail_log), delta_color="inverse")
+            
+            if fail_log:
+                with st.expander("⚠️ 查看失败日志"):
+                    st.text("\n".join(fail_log))
+            
+            # --- 下载逻辑 ---
+            if success_data:
+                timestamp = int(time.time())
+                
+                # 模式 A: ZIP 打包
+                if "ZIP" in output_mode:
+                    zip_buffer = io.BytesIO()
+                    with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zf:
+                        for idx, (fname, text) in enumerate(success_data):
+                            # 防止重名
+                            safe_name = f"{str(idx+1).zfill(2)}_{fname}.md"
+                            zf.writestr(safe_name, text.encode('utf-8'))
+                        
+                        if fail_log:
+                            zf.writestr("_FAIL_LOG.txt", "\n".join(fail_log).encode('utf-8'))
+                            
+                    st.download_button(
+                        label="📥 下载 ZIP 压缩包",
+                        data=zip_buffer.getvalue(),
+                        file_name=f"magic_clipper_{timestamp}.zip",
+                        mime="application/zip",
+                        type="primary"
+                    )
+                
+                # 模式 B: 合并 Markdown
+                else:
+                    merged_content = f"# Magic Clipper Export\nDate: {time.strftime('%Y-%m-%d')}\n\n---\n\n"
+                    for fname, text in success_data:
+                        merged_content += f"{text}\n\n"
+                    
+                    if fail_log:
+                        merged_content += "\n\n# ⚠️ 失败日志\n" + "\n".join(fail_log)
+                        
+                    st.download_button(
+                        label="📥 下载合并文档 (.md)",
+                        data=merged_content.encode('utf-8'),
+                        file_name=f"merged_export_{timestamp}.md",
+                        mime="text/markdown",
+                        type="primary"
+                    )
